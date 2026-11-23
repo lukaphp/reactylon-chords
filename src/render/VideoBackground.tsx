@@ -9,6 +9,7 @@ import {
 } from '@babylonjs/core';
 import { useScene } from 'reactylon';
 import type { HandTracker } from '../tracking/HandTracker';
+import { useStringStore } from '../strings/stringStore';
 
 interface VideoBackgroundProps {
   video: HTMLVideoElement | null;
@@ -45,10 +46,9 @@ export function VideoBackground({ video, tracker }: VideoBackgroundProps) {
         Texture.BILINEAR_SAMPLINGMODE,
         { autoPlay: true, loop: false, autoUpdateTexture: true },
       );
-      // Mirror horizontally to match natural user perspective and mirrored landmark X.
       videoTex.uScale = -1;
       videoTex.uOffset = 1;
-      videoTex.level = 0.82;
+      videoTex.level = 0.85;
 
       mat.emissiveTexture = videoTex;
       mat.emissiveColor = Color3.Black();
@@ -58,6 +58,15 @@ export function VideoBackground({ video, tracker }: VideoBackgroundProps) {
       const { planeWidth, planeHeight } = tracker.projection;
       plane.scaling.x = planeWidth;
       plane.scaling.y = planeHeight;
+
+      const opacity = useStringStore.getState().settings.webcamOpacity;
+      if (!videoTex || opacity <= 0.01) {
+        // Pure pitch-black Stage Mode
+        plane.isVisible = false;
+      } else {
+        plane.isVisible = true;
+        videoTex.level = opacity;
+      }
     });
 
     return () => {

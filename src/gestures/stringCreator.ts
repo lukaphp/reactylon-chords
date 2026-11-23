@@ -6,6 +6,73 @@ import { lengthToPitch, stringLength, type TuningConfig } from '../strings/tunin
 export const MIN_STRING_LENGTH = 0.22;
 const POST_COMMIT_COOLDOWN_MS = 450;
 const SNAPSHOT_BUFFER_SIZE = 3;
+const SNAP_ANGLE_RAD = (6 * Math.PI) / 180; // ±6 degrees magnetic snap
+
+export type SnapAxis = 'horizontal' | 'vertical' | null;
+
+/**
+ * Applies gentle ±6° magnetic snap to horizontal or vertical alignment around midpoint.
+ */
+export function snapEndpointsSymmetric(
+  a: Vec2,
+  b: Vec2,
+  enabled: boolean,
+): { a: Vec2; b: Vec2; snappedAxis: SnapAxis } {
+  if (!enabled) return { a, b, snappedAxis: null };
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const len = Math.hypot(dx, dy);
+  if (len < MIN_STRING_LENGTH * 0.6) return { a, b, snappedAxis: null };
+
+  const angleFromHoriz = Math.atan2(Math.abs(dy), Math.abs(dx));
+  if (angleFromHoriz <= SNAP_ANGLE_RAD) {
+    const midY = (a.y + b.y) * 0.5;
+    return {
+      a: { x: a.x, y: midY },
+      b: { x: b.x, y: midY },
+      snappedAxis: 'horizontal',
+    };
+  }
+
+  const angleFromVert = Math.atan2(Math.abs(dx), Math.abs(dy));
+  if (angleFromVert <= SNAP_ANGLE_RAD) {
+    const midX = (a.x + b.x) * 0.5;
+    return {
+      a: { x: midX, y: a.y },
+      b: { x: midX, y: b.y },
+      snappedAxis: 'vertical',
+    };
+  }
+
+  return { a, b, snappedAxis: null };
+}
+
+/**
+ * Applies gentle ±6° magnetic snap for a single dragged endpoint relative to a fixed anchor.
+ */
+export function snapSingleEndpoint(
+  target: Vec2,
+  fixed: Vec2,
+  enabled: boolean,
+): { point: Vec2; snappedAxis: SnapAxis } {
+  if (!enabled) return { point: target, snappedAxis: null };
+  const dx = target.x - fixed.x;
+  const dy = target.y - fixed.y;
+  const len = Math.hypot(dx, dy);
+  if (len < MIN_STRING_LENGTH * 0.6) return { point: target, snappedAxis: null };
+
+  const angleFromHoriz = Math.atan2(Math.abs(dy), Math.abs(dx));
+  if (angleFromHoriz <= SNAP_ANGLE_RAD) {
+    return { point: { x: target.x, y: fixed.y }, snappedAxis: 'horizontal' };
+  }
+
+  const angleFromVert = Math.atan2(Math.abs(dx), Math.abs(dy));
+  if (angleFromVert <= SNAP_ANGLE_RAD) {
+    return { point: { x: fixed.x, y: target.y }, snappedAxis: 'vertical' };
+  }
+
+  return { point: target, snappedAxis: null };
+}
 
 interface AnchorSnapshot {
   a: Vec2;
@@ -27,6 +94,7 @@ export interface TwoHandCreationSession {
   note: string;
   freq: number;
   isValid: boolean;
+  snappedAxis: SnapAxis;
   /** Stabilized history so finger-opening jitter at release doesn't shift the placed endpoints. */
   history: AnchorSnapshot[];
 }
@@ -51,7 +119,7 @@ export interface TwoHandCreationUpdate {
 /**
  * Two-hand string creation:
  * 1) Bring both hands to a common point and pinch (thumb + index) with both hands.
- * 2) Pull hands apart to stretch and tune the string live between both hands.
+ * 2) Pull hands apart to stretch and tune the string live between both hands (with optional ±6° magnetic snap).
  * 3) Release either hand's pinch to lock both anchors cleanly in place.
  */
 export class StringCreator {
@@ -80,6 +148,7 @@ export class StringCreator {
     tuning: TuningConfig,
     nowMs: number,
     disabled: boolean,
+    snapEnabled = true,
   ): TwoHandCreationUpdate {
     const emptyHint: TwoHandReadyHint = {
       visible: false,
@@ -104,7 +173,6 @@ export class StringCreator {
       const handA = hands.find((h) => h.id === this.session!.handIdA);
       const handB = hands.find((h) => h.id === this.session!.handIdB);
 
-      // If either hand disappears from tracking, cancel safely
       if (!handA || !handB) {
         this.session = null;
         this.cooldownUntilMs = nowMs + 250;
@@ -123,7 +191,6 @@ export class StringCreator {
       const bothPinching = Boolean(pinchA?.isPinching && pinchB?.isPinching);
 
       if (!bothPinching) {
-        // Commit using stabilized snapshot from ~2 frames before finger opening
         const snap =
           this.session.history.length >= 2
             ? this.session.history[0]
@@ -154,23 +221,23 @@ export class StringCreator {
         };
       }
 
-      // Still pinching with both hands -> update endpoints live
-      const posA = pinchA!.point;
-      const posB = pinchB!.point;
-      this.session.anchorA.x = posA.x;
-      this.session.anchorA.y = posA.y;
-      this.session.anchorB.x = posB.x;
-      this.session.anchorB.y = posB.y;
+      // Still pinching with both hands -> apply optional magnetic snap & update endpoints live
+      const snapped = snapEndpointsSymmetric(pinchA!.point, pinchB!.point, snapEnabled);
+      this.session.anchorA.x = snapped.a.x;
+      this.session.anchorA.y = snapped.a.y;
+      this.session.anchorB.x = snapped.b.x;
+      this.session.anchorB.y = snapped.b.y;
+      this.session.snappedAxis = snapped.snappedAxis;
 
       this.session.history.push({
-        a: { x: posA.x, y: posA.y },
-        b: { x: posB.x, y: posB.y },
+        a: { x: snapped.a.x, y: snapped.a.y },
+        b: { x: snapped.b.x, y: snapped.b.y },
       });
       if (this.session.history.length > SNAPSHOT_BUFFER_SIZE) {
         this.session.history.shift();
       }
 
-      const len = stringLength(posA, posB);
+      const len = stringLength(snapped.a, snapped.b);
       const wasValid = this.session.isValid;
       const prevNote = this.session.note;
       this.session.isValid = len >= MIN_STRING_LENGTH;
@@ -220,7 +287,6 @@ export class StringCreator {
     }
 
     const avgScale = (h0.handScale + h1.handScale) * 0.5;
-    // Distance between the two hands' pinch points (and also check index tips directly)
     const pinchDist = distance2D(p0.point, p1.point);
     const tipDist = distance2D(h0.fingertips[8].position, h1.fingertips[8].position);
     const pairDist = Math.min(pinchDist, tipDist);
@@ -235,7 +301,6 @@ export class StringCreator {
 
     const pinchingCount = (p0.isPinching ? 1 : 0) + (p1.isPinching ? 1 : 0);
 
-    // Engage creation when both hands meet at a common point and both pinch
     if (pairDist <= engageRadius && p0.isPinching && p1.isPinching) {
       const pitch = lengthToPitch(MIN_STRING_LENGTH, tuning);
       this.session = {
@@ -246,6 +311,7 @@ export class StringCreator {
         note: pitch.note,
         freq: pitch.freq,
         isValid: false,
+        snappedAxis: null,
         history: [{ a: { ...p0.point }, b: { ...p1.point } }],
       };
 
@@ -259,7 +325,6 @@ export class StringCreator {
       };
     }
 
-    // Show magnetic common-point halo when the two hands approach each other
     const readyHint: TwoHandReadyHint =
       pairDist <= hintRadius
         ? { visible: true, position: mid, pinchingCount }

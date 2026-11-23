@@ -1,6 +1,8 @@
 # Corde nell'aria
 
-Strumento musicale interattivo in realtà aumentata 2D basato su **Reactylon (Babylon.js)**, **MediaPipe HandLandmarker** e **Tone.js**.
+**[Demo live (GitHub Pages)](https://lukaphp.github.io/reactylon-chords/)**
+
+Strumento musicale interattivo in realtà aumentata 2D basato su **Reactylon (Babylon.js)**, **MediaPipe HandLandmarker**, **Tone.js** e **Web MIDI API**.
 
 Disegna corde luminose nell'aria davanti alla webcam, intonale cambiandone la lunghezza e pizzicale al volo.
 

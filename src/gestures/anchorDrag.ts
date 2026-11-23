@@ -1,15 +1,22 @@
 import type { Vec2 } from '../tracking/types';
-import { MIN_STRING_LENGTH } from './stringCreator';
+import { MIN_STRING_LENGTH, snapSingleEndpoint } from './stringCreator';
 import { distance2D } from '../strings/collision';
+
+export type DragMode = 'A' | 'B' | 'body';
 
 export interface AnchorDragSession {
   handId: number;
   stringId: string;
-  end: 'A' | 'B';
+  mode: DragMode;
+  /** Used when mode === 'body' to translate the entire string preserving length & pitch. */
+  startPinch: Vec2;
+  origA: Vec2;
+  origB: Vec2;
 }
 
 /**
- * Manages grabbing and dragging an existing string anchor handle per hand.
+ * Manages grabbing and dragging an existing string anchor handle ('A' | 'B')
+ * OR translating an entire selected string ('body') without changing its length/pitch.
  */
 export class AnchorDragController {
   private sessions = new Map<number, AnchorDragSession>();
@@ -29,28 +36,75 @@ export class AnchorDragController {
     return false;
   }
 
-  public start(handId: number, stringId: string, end: 'A' | 'B'): AnchorDragSession {
-    const session: AnchorDragSession = { handId, stringId, end };
+  public startHandle(
+    handId: number,
+    stringId: string,
+    end: 'A' | 'B',
+  ): AnchorDragSession {
+    const session: AnchorDragSession = {
+      handId,
+      stringId,
+      mode: end,
+      startPinch: { x: 0, y: 0 },
+      origA: { x: 0, y: 0 },
+      origB: { x: 0, y: 0 },
+    };
     this.sessions.set(handId, session);
     return session;
   }
 
+  public startBodyMove(
+    handId: number,
+    stringId: string,
+    startPinch: Vec2,
+    origA: Vec2,
+    origB: Vec2,
+  ): AnchorDragSession {
+    const session: AnchorDragSession = {
+      handId,
+      stringId,
+      mode: 'body',
+      startPinch: { ...startPinch },
+      origA: { ...origA },
+      origB: { ...origB },
+    };
+    this.sessions.set(handId, session);
+    return session;
+  }
+
+  public computeTranslatedAnchors(
+    session: AnchorDragSession,
+    currentPinch: Vec2,
+  ): { anchorA: Vec2; anchorB: Vec2 } {
+    const dx = currentPinch.x - session.startPinch.x;
+    const dy = currentPinch.y - session.startPinch.y;
+    return {
+      anchorA: { x: session.origA.x + dx, y: session.origA.y + dy },
+      anchorB: { x: session.origB.x + dx, y: session.origB.y + dy },
+    };
+  }
+
   /**
-   * Computes a clamped target position for the dragged anchor so the string never
-   * collapses below MIN_STRING_LENGTH.
+   * Computes a clamped (and optionally ±6° snapped) target position for a dragged anchor
+   * so the string never collapses below MIN_STRING_LENGTH.
    */
-  public clampPosition(target: Vec2, fixedAnchor: Vec2): Vec2 {
-    const dist = distance2D(target, fixedAnchor);
+  public clampAndSnapPosition(
+    target: Vec2,
+    fixedAnchor: Vec2,
+    snapEnabled: boolean,
+  ): Vec2 {
+    const snapped = snapSingleEndpoint(target, fixedAnchor, snapEnabled).point;
+    const dist = distance2D(snapped, fixedAnchor);
     if (dist >= MIN_STRING_LENGTH) {
-      return target;
+      return snapped;
     }
     if (dist < 1e-5) {
       return { x: fixedAnchor.x + MIN_STRING_LENGTH, y: fixedAnchor.y };
     }
     const scale = MIN_STRING_LENGTH / dist;
     return {
-      x: fixedAnchor.x + (target.x - fixedAnchor.x) * scale,
-      y: fixedAnchor.y + (target.y - fixedAnchor.y) * scale,
+      x: fixedAnchor.x + (snapped.x - fixedAnchor.x) * scale,
+      y: fixedAnchor.y + (snapped.y - fixedAnchor.y) * scale,
     };
   }
 

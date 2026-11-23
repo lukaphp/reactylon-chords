@@ -64,6 +64,7 @@ function mediapipeWasmPlugin(): Plugin {
 }
 
 export default defineConfig({
+  base: process.env.GITHUB_ACTIONS ? '/reactylon-chords/' : '/',
   plugins: [
     mediapipeWasmPlugin(),
     babel({

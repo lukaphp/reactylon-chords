@@ -1,5 +1,8 @@
 import { create } from 'zustand';
 import type { Vec2 } from '../tracking/types';
+import type { SoundPresetId } from '../audio/audioEngine';
+import type { SnapAxis } from '../gestures/stringCreator';
+import type { LooperMode } from '../creative/looper';
 import {
   DEFAULT_TUNING,
   lengthToPitch,
@@ -8,6 +11,12 @@ import {
   type ScaleId,
   type TuningConfig,
 } from './tuning';
+import {
+  loadSavedPresets,
+  persistPresets,
+  type SavedStringSpec,
+  type StringPreset,
+} from './presets';
 
 export interface StringVibration {
   /** Current peak amplitude in world units. */
@@ -41,38 +50,82 @@ export type DeleteButtonMode = 'near_string' | 'top_bar';
 
 export interface StringSettings {
   tuning: TuningConfig;
-  showHandOverlay: boolean;
+  // Audio & FX
+  soundPreset: SoundPresetId;
+  reverbEnabled: boolean;
+  delayEnabled: boolean;
+  chorusEnabled: boolean;
+  shimmerEnabled: boolean;
+  stereoPanEnabled: boolean;
+  harmonicsEnabled: boolean;
+  previewSoundOnDrag: boolean;
+  // Web MIDI
+  midiEnabled: boolean;
+  midiPortId: string | null;
+  midiChannel: number;
+  midiGateMs: number;
+  midiSendCC74: boolean;
+  internalAudioMuted: boolean;
+  // Gestures & Editing
+  editRequiresSelection: boolean;
+  snapEnabled: boolean;
+  palmMuteEnabled: boolean;
+  expressionHandEnabled: boolean;
   allFingertips: boolean;
   deleteButtonMode: DeleteButtonMode;
-  /** When true (default), strings can only be resized/edited after selecting them via long-press. */
-  editRequiresSelection: boolean;
-  previewSoundOnDrag: boolean;
-  reverbEnabled: boolean;
   intensityCurve: number;
   minIntensity: number;
   filterMinCutoff: number;
   filterBeta: number;
+  // Creative modes
+  ballSequencerEnabled: boolean;
+  ballBpm: number;
+  ballGravity: number;
+  ballRestitution: number;
+  ballEmitterX: number;
+  ballEmitterY: number;
+  looperBpm: number;
+  looperBars: 2 | 4;
+  looperQuantize: boolean;
+  // Visual & Stage Mode
+  showHandOverlay: boolean;
+  webcamOpacity: number;
+  particlesEnabled: boolean;
+  fingerTrailsEnabled: boolean;
 }
 
 interface StringStoreState {
   strings: AirString[];
   selectedId: string | null;
+  presets: StringPreset[];
   settings: StringSettings;
 
   addString: (anchorA: Vec2, anchorB: Vec2) => AirString;
   removeString: (id: string) => void;
   clearStrings: () => void;
   selectString: (id: string | null) => void;
-  /** Updates anchors & pitch in-place without triggering a React re-render (60fps safe). */
+  loadStringSpecs: (specs: readonly SavedStringSpec[], tuning?: TuningConfig) => void;
+
+  /** Updates one anchor & pitch in-place without triggering a React re-render (60fps safe). */
   updateStringAnchorsInPlace: (id: string, end: 'A' | 'B', pos: Vec2) => {
     noteChanged: boolean;
     note: string;
     freq: number;
   } | null;
+  /** Translates both anchors in-place preserving exact length & pitch (zero React re-renders). */
+  translateStringInPlace: (id: string, anchorA: Vec2, anchorB: Vec2) => void;
   /** Triggers vibration in-place without triggering a React re-render. */
   triggerVibrationInPlace: (id: string, intensity: number, nowMs: number) => void;
+  /** Immediately damps visual vibration (Palm Mute). */
+  dampVibrationInPlace: (id: string) => void;
+
   updateTuning: (partial: Partial<TuningConfig>) => void;
   updateSettings: (partial: Partial<Omit<StringSettings, 'tuning'>>) => void;
+
+  saveCurrentPreset: (name: string) => StringPreset;
+  loadPresetById: (id: string) => boolean;
+  deletePreset: (id: string) => void;
+  importPreset: (preset: StringPreset) => void;
 }
 
 let nextStringSeq = 1;
@@ -88,51 +141,76 @@ function createIdleVibration(): StringVibration {
   };
 }
 
-/**
- * Computes visual angular frequency ω tied to audio frequency, slowed down so
- * the standing wave reads clearly at 60 fps.
- */
 function freqToVisualOmega(freqHz: number): number {
   const clamped = Math.max(80, Math.min(2000, freqHz));
-  const norm = Math.log2(clamped / 80) / Math.log2(2000 / 80); // 0..1
-  return 26 + norm * 38; // ~4 Hz to ~10 Hz visual oscillation
+  const norm = Math.log2(clamped / 80) / Math.log2(2000 / 80);
+  return 26 + norm * 38;
+}
+
+function buildAirString(anchorA: Vec2, anchorB: Vec2, tuning: TuningConfig): AirString {
+  const len = stringLength(anchorA, anchorB);
+  const pitch = lengthToPitch(len, tuning);
+  return {
+    id: `str-${nextStringSeq++}`,
+    anchorA: { x: anchorA.x, y: anchorA.y },
+    anchorB: { x: anchorB.x, y: anchorB.y },
+    midi: pitch.midi,
+    freq: pitch.freq,
+    note: pitch.note,
+    normalizedPitch: pitch.normalizedPitch,
+    selected: false,
+    vibration: createIdleVibration(),
+  };
 }
 
 export const useStringStore = create<StringStoreState>((set, get) => ({
   strings: [],
   selectedId: null,
+  presets: typeof window !== 'undefined' ? loadSavedPresets() : [],
   settings: {
     tuning: { ...DEFAULT_TUNING },
-    showHandOverlay: true,
+    soundPreset: 'harp',
+    reverbEnabled: true,
+    delayEnabled: false,
+    chorusEnabled: false,
+    shimmerEnabled: false,
+    stereoPanEnabled: true,
+    harmonicsEnabled: false,
+    previewSoundOnDrag: true,
+    midiEnabled: false,
+    midiPortId: null,
+    midiChannel: 1,
+    midiGateMs: 650,
+    midiSendCC74: true,
+    internalAudioMuted: false,
+    editRequiresSelection: true,
+    snapEnabled: true,
+    palmMuteEnabled: true,
+    expressionHandEnabled: true,
     allFingertips: false,
     deleteButtonMode: 'near_string',
-    editRequiresSelection: true,
-    previewSoundOnDrag: true,
-    reverbEnabled: true,
     intensityCurve: 0.65,
     minIntensity: 0.18,
     filterMinCutoff: 1.5,
     filterBeta: 0.08,
+    ballSequencerEnabled: false,
+    ballBpm: 110,
+    ballGravity: 1.6,
+    ballRestitution: 0.88,
+    ballEmitterX: 0,
+    ballEmitterY: 0.78,
+    looperBpm: 110,
+    looperBars: 2,
+    looperQuantize: true,
+    showHandOverlay: true,
+    webcamOpacity: 0.85,
+    particlesEnabled: true,
+    fingerTrailsEnabled: true,
   },
 
   addString: (anchorA, anchorB) => {
     const tuning = get().settings.tuning;
-    const len = stringLength(anchorA, anchorB);
-    const pitch = lengthToPitch(len, tuning);
-    const id = `str-${nextStringSeq++}`;
-
-    const newString: AirString = {
-      id,
-      anchorA: { ...anchorA },
-      anchorB: { ...anchorB },
-      midi: pitch.midi,
-      freq: pitch.freq,
-      note: pitch.note,
-      normalizedPitch: pitch.normalizedPitch,
-      selected: false,
-      vibration: createIdleVibration(),
-    };
-
+    const newString = buildAirString(anchorA, anchorB, tuning);
     set((state) => ({
       strings: [...state.strings, newString],
     }));
@@ -160,6 +238,22 @@ export const useStringStore = create<StringStoreState>((set, get) => ({
     }));
   },
 
+  loadStringSpecs: (specs, tuningOverride) => {
+    set((state) => {
+      const nextTuning = tuningOverride
+        ? { ...state.settings.tuning, ...tuningOverride }
+        : state.settings.tuning;
+      const nextStrings = specs.map((spec) =>
+        buildAirString(spec.anchorA, spec.anchorB, nextTuning),
+      );
+      return {
+        strings: nextStrings,
+        selectedId: null,
+        settings: { ...state.settings, tuning: nextTuning },
+      };
+    });
+  },
+
   updateStringAnchorsInPlace: (id, end, pos) => {
     const state = get();
     const target = state.strings.find((s) => s.id === id);
@@ -185,13 +279,21 @@ export const useStringStore = create<StringStoreState>((set, get) => ({
     return { noteChanged, note: pitch.note, freq: pitch.freq };
   },
 
+  translateStringInPlace: (id, anchorA, anchorB) => {
+    const target = get().strings.find((s) => s.id === id);
+    if (!target) return;
+    target.anchorA.x = anchorA.x;
+    target.anchorA.y = anchorA.y;
+    target.anchorB.x = anchorB.x;
+    target.anchorB.y = anchorB.y;
+  },
+
   triggerVibrationInPlace: (id, intensity, nowMs) => {
     const target = get().strings.find((s) => s.id === id);
     if (!target) return;
 
     const clamped = Math.max(0.05, Math.min(1, intensity));
     const len = stringLength(target.anchorA, target.anchorB);
-    // Amplitude scales gently with string length & pluck intensity
     const maxAmp = Math.min(0.14, Math.max(0.045, len * 0.1));
 
     target.vibration.amplitude = maxAmp * (0.25 + 0.75 * clamped);
@@ -202,10 +304,19 @@ export const useStringStore = create<StringStoreState>((set, get) => ({
     target.vibration.lastPluckMs = nowMs;
   },
 
+  dampVibrationInPlace: (id) => {
+    const target = get().strings.find((s) => s.id === id);
+    if (!target) return;
+    target.vibration.amplitude *= 0.18;
+    if (target.vibration.amplitude < 0.002) {
+      target.vibration.amplitude = 0;
+    }
+    target.vibration.intensity = 0;
+  },
+
   updateTuning: (partial) => {
     set((state) => {
       const nextTuning: TuningConfig = { ...state.settings.tuning, ...partial };
-      // Re-tune existing strings immediately when scale or root changes
       const updatedStrings = state.strings.map((s) => {
         const len = stringLength(s.anchorA, s.anchorB);
         const pitch = lengthToPitch(len, nextTuning);
@@ -227,10 +338,49 @@ export const useStringStore = create<StringStoreState>((set, get) => ({
       settings: { ...state.settings, ...partial },
     }));
   },
+
+  saveCurrentPreset: (name) => {
+    const state = get();
+    const trimmed = name.trim() || `Set ${state.presets.length + 1}`;
+    const preset: StringPreset = {
+      id: `preset-${Date.now()}`,
+      name: trimmed,
+      createdAt: Date.now(),
+      tuning: { ...state.settings.tuning },
+      strings: state.strings.map((s) => ({
+        anchorA: { x: s.anchorA.x, y: s.anchorA.y },
+        anchorB: { x: s.anchorB.x, y: s.anchorB.y },
+      })),
+    };
+    const nextPresets = [...state.presets, preset].slice(-9);
+    persistPresets(nextPresets);
+    set({ presets: nextPresets });
+    return preset;
+  },
+
+  loadPresetById: (id) => {
+    const preset = get().presets.find((p) => p.id === id);
+    if (!preset) return false;
+    get().loadStringSpecs(preset.strings, preset.tuning);
+    return true;
+  },
+
+  deletePreset: (id) => {
+    const nextPresets = get().presets.filter((p) => p.id !== id);
+    persistPresets(nextPresets);
+    set({ presets: nextPresets });
+  },
+
+  importPreset: (preset) => {
+    const nextPresets = [...get().presets, preset].slice(-9);
+    persistPresets(nextPresets);
+    set({ presets: nextPresets });
+    get().loadStringSpecs(preset.strings, preset.tuning);
+  },
 }));
 
 /**
- * Non-reactive transient interaction state updated every frame in Babylon's render loop
+ * Non-reactive transient interaction & creative state updated every frame in Babylon's render loop
  * and read directly by render components without causing React re-renders.
  */
 export interface CreationPreviewState {
@@ -240,6 +390,7 @@ export interface CreationPreviewState {
   note: string;
   freq: number;
   isValid: boolean;
+  snappedAxis: SnapAxis;
 }
 
 export interface TwoHandReadyVisualState {
@@ -263,8 +414,23 @@ export interface DeleteHoverVisualState {
 
 export interface HoveredHandleVisualState {
   stringId: string | null;
-  end: 'A' | 'B' | null;
+  end: 'A' | 'B' | 'body' | null;
   grabbed: boolean;
+}
+
+export interface ImpactBurstEvent {
+  x: number;
+  y: number;
+  r: number;
+  g: number;
+  b: number;
+  intensity: number;
+}
+
+export interface BallVisualSnapshot {
+  x: number;
+  y: number;
+  radius: number;
 }
 
 export const transientState: {
@@ -274,6 +440,22 @@ export const transientState: {
   deleteHover: DeleteHoverVisualState;
   hoveredHandle: HoveredHandleVisualState;
   activeHandPinch: Record<number, boolean>;
+  pendingImpacts: ImpactBurstEvent[];
+  expression: { active: boolean; value: number };
+  balls: BallVisualSnapshot[];
+  looper: {
+    mode: LooperMode;
+    eventCount: number;
+    progress: number;
+    currentBeat: number;
+    totalBeats: number;
+  };
+  /** Imperative command bridge from HUD buttons -> render-loop controllers. */
+  commands: {
+    looperAction: null | 'record' | 'overdub' | 'play_toggle' | 'stop' | 'clear';
+    ballSpawnNow: boolean;
+    ballClear: boolean;
+  };
 } = {
   creationPreview: {
     active: false,
@@ -282,6 +464,7 @@ export const transientState: {
     note: '',
     freq: 0,
     isValid: false,
+    snappedAxis: null,
   },
   twoHandReady: {
     visible: false,
@@ -305,6 +488,21 @@ export const transientState: {
     grabbed: false,
   },
   activeHandPinch: {},
+  pendingImpacts: [],
+  expression: { active: false, value: 0 },
+  balls: [],
+  looper: {
+    mode: 'idle',
+    eventCount: 0,
+    progress: 0,
+    currentBeat: 0,
+    totalBeats: 8,
+  },
+  commands: {
+    looperAction: null,
+    ballSpawnNow: false,
+    ballClear: false,
+  },
 };
 
 export function computeDeleteButtonPosition(
@@ -322,7 +520,6 @@ export function computeDeleteButtonPosition(
   const dy = str.anchorB.y - str.anchorA.y;
   const len = Math.max(Math.hypot(dx, dy), 1e-4);
 
-  // Unit perpendicular vector pointing generally upward (positive Y) when possible
   let nx = -dy / len;
   let ny = dx / len;
   if (ny < 0) {
@@ -337,7 +534,6 @@ export function computeDeleteButtonPosition(
   let bx = midX + nx * offset;
   let by = midY + ny * offset;
 
-  // If too close to the top edge, flip to the opposite side of the string
   if (by > marginY) {
     bx = midX - nx * offset;
     by = midY - ny * offset;
@@ -349,4 +545,4 @@ export function computeDeleteButtonPosition(
   };
 }
 
-export type { RootNote, ScaleId };
+export type { RootNote, ScaleId, SoundPresetId, StringPreset };

@@ -20,17 +20,25 @@ import { PinchDetector, type PinchState } from '../gestures/pinch';
 import { StringCreator } from '../gestures/stringCreator';
 import { AnchorDragController } from '../gestures/anchorDrag';
 import { LongPressController } from '../gestures/longPress';
+import { detectPalmMute } from '../gestures/palmMute';
+import { ExpressionHandController } from '../gestures/expressionHand';
 import {
+  distance2D,
   hitTestHandles,
+  hitTestStrings,
   mapSpeedToIntensity,
   testFingerStringCollision,
 } from '../strings/collision';
-import { transientState, useStringStore } from '../strings/stringStore';
+import { transientState, useStringStore, type AirString } from '../strings/stringStore';
 import { audioEngine } from '../audio/audioEngine';
+import { midiEngine } from '../audio/midiEngine';
+import { BallSequencer } from '../creative/ballSequencer';
+import { EventLooper } from '../creative/looper';
 import { VideoBackground } from './VideoBackground';
-import { StringMesh } from './StringMesh';
+import { StringMesh, pitchToNeonColor } from './StringMesh';
 import { DeleteButton } from './DeleteButton';
 import { HandOverlay } from './HandOverlay';
+import { EffectsLayer } from './EffectsLayer';
 
 const PLUCK_COOLDOWN_MS = 100;
 const PLUCK_TOUCH_RADIUS = 0.048;
@@ -42,7 +50,8 @@ interface AirSceneProps {
 
 /**
  * Configures the orthographic camera, Neon GlowLayer, and runs the single per-frame
- * Babylon render-loop controller for gestures, collisions, audio plucking, and vibration.
+ * Babylon render-loop controller for gestures, collisions, audio/MIDI plucking,
+ * palm mute, expression hand, ball sequencer, looper, and vibration physics.
  */
 function SceneController({ tracker }: { tracker: HandTracker }) {
   const scene = useScene();
@@ -51,13 +60,13 @@ function SceneController({ tracker }: { tracker: HandTracker }) {
 
   // Sync camera & GlowLayer
   useEffect(() => {
-    scene.clearColor = new Color4(0.03, 0.04, 0.08, 1);
+    scene.clearColor = new Color4(0.02, 0.025, 0.055, 1);
 
     const glowLayer = new GlowLayer('neon-glow', scene, {
       mainTextureSamples: 4,
       blurKernelSize: 48,
     });
-    glowLayer.intensity = 0.85;
+    glowLayer.intensity = 0.9;
     glowLayer.customEmissiveColorSelector = (mesh, _subMesh, _material, result) => {
       if (mesh.metadata?.excludeGlow) {
         result.set(0, 0, 0, 0);
@@ -125,18 +134,79 @@ function SceneController({ tracker }: { tracker: HandTracker }) {
     };
   }, [scene, engine, tracker]);
 
-  // Main non-reactive interaction & physics render loop
+  // Main non-reactive interaction, creative & physics render loop
   useEffect(() => {
     const pinchDetector = new PinchDetector();
     const stringCreator = new StringCreator();
     const anchorDrag = new AnchorDragController();
     const longPress = new LongPressController();
+    const expressionCtrl = new ExpressionHandController();
+    const ballSequencer = new BallSequencer();
+    const looper = new EventLooper();
 
-    // Tracks which (handId, fingerIdx, stringId) pairs are currently inside the touch envelope
-    // so pluck only fires on the rising edge (entry / crossing), never repeatedly during dwell.
     const touchingStrings = new Set<string>();
     const activeHandIds = new Set<number>();
+    let emitterDragHandId: number | null = null;
     let lastFrameMs = performance.now();
+
+    const fireStringPluck = (
+      str: AirString,
+      intensity: number,
+      s: number,
+      nowMs: number,
+      recordInLooper: boolean,
+    ) => {
+      const store = useStringStore.getState();
+      const { settings } = store;
+      const aspect = Math.max(0.5, tracker.projection.canvasAspect);
+      const midX = (str.anchorA.x + str.anchorB.x) * 0.5;
+      const pan = Math.max(-0.85, Math.min(0.85, (midX / aspect) * 0.85));
+
+      audioEngine.pluck(str.freq, intensity, {
+        pan,
+        s,
+        stringId: str.id,
+        harmonicsEnabled: settings.harmonicsEnabled,
+      });
+      midiEngine.sendNote(str.midi, intensity, {
+        s,
+        gateMs: settings.midiGateMs,
+        stringId: str.id,
+      });
+      store.triggerVibrationInPlace(str.id, intensity, nowMs);
+
+      // Queue impact particle burst at exact touch point s
+      if (settings.particlesEnabled) {
+        const hitX = str.anchorA.x + (str.anchorB.x - str.anchorA.x) * s;
+        const hitY = str.anchorA.y + (str.anchorB.y - str.anchorA.y) * s;
+        const col = pitchToNeonColor(str.normalizedPitch);
+        transientState.pendingImpacts.push({
+          x: hitX,
+          y: hitY,
+          r: col.r,
+          g: col.g,
+          b: col.b,
+          intensity,
+        });
+      }
+
+      if (recordInLooper) {
+        looper.recordEvent(
+          {
+            stringId: str.id,
+            midi: str.midi,
+            freq: str.freq,
+            intensity,
+            s,
+            pan,
+          },
+          nowMs,
+          settings.looperBpm,
+          settings.looperBars,
+          settings.looperQuantize,
+        );
+      }
+    };
 
     const obs = scene.onBeforeRenderObservable.add(() => {
       const nowMs = performance.now();
@@ -145,6 +215,28 @@ function SceneController({ tracker }: { tracker: HandTracker }) {
 
       const store = useStringStore.getState();
       const { strings, selectedId, settings } = store;
+
+      // 0) Handle imperative commands from HUD (Looper & Ball Sequencer)
+      if (transientState.commands.looperAction) {
+        const action = transientState.commands.looperAction;
+        transientState.commands.looperAction = null;
+        if (action === 'record') looper.startRecording(nowMs, false);
+        else if (action === 'overdub') looper.startRecording(nowMs, true);
+        else if (action === 'play_toggle') looper.togglePlay(nowMs);
+        else if (action === 'stop') looper.stopRecordingOrPlay();
+        else if (action === 'clear') looper.clear();
+      }
+      if (transientState.commands.ballSpawnNow) {
+        transientState.commands.ballSpawnNow = false;
+        ballSequencer.spawnBall({
+          x: settings.ballEmitterX,
+          y: settings.ballEmitterY,
+        });
+      }
+      if (transientState.commands.ballClear) {
+        transientState.commands.ballClear = false;
+        ballSequencer.clear();
+      }
 
       // 1) Advance string vibration timers
       for (let i = 0; i < strings.length; i++) {
@@ -165,12 +257,13 @@ function SceneController({ tracker }: { tracker: HandTracker }) {
         transientState.activeHandPinch[hand.id] = pinch.isPinching;
       }
 
-      // Clean up hands that disappeared from tracking (safe release!)
+      // Clean up disappeared hands safely
       for (const prevId of activeHandIds) {
         if (!presentHandIds.has(prevId)) {
           pinchDetector.resetHand(prevId);
-          anchorDrag.end(prevId); // Anchor stays safely where it was
+          anchorDrag.end(prevId);
           longPress.clearHand(prevId);
+          if (emitterDragHandId === prevId) emitterDragHandId = null;
           transientState.activeHandPinch[prevId] = false;
 
           for (const key of Array.from(touchingStrings)) {
@@ -196,7 +289,7 @@ function SceneController({ tracker }: { tracker: HandTracker }) {
       };
       let hoveredHandle = {
         stringId: null as string | null,
-        end: null as 'A' | 'B' | null,
+        end: null as 'A' | 'B' | 'body' | null,
         grabbed: false,
       };
 
@@ -204,22 +297,24 @@ function SceneController({ tracker }: { tracker: HandTracker }) {
         ? strings.find((s) => s.id === selectedId) ?? null
         : null;
 
-      let anyAnchorDragging = false;
-      for (const hand of frame.hands) {
-        if (anchorDrag.isActive(hand.id)) {
-          anyAnchorDragging = true;
-          break;
+      let anyAnchorDragging = emitterDragHandId !== null;
+      if (!anyAnchorDragging) {
+        for (const hand of frame.hands) {
+          if (anchorDrag.isActive(hand.id)) {
+            anyAnchorDragging = true;
+            break;
+          }
         }
       }
 
-      // 2) Two-hand common-point string creation:
-      //    Touch both hands together & pinch both -> pull apart -> release to place cleanly!
+      // 2) Two-hand common-point string creation (with ±6° magnetic snap)
       const creation = stringCreator.update(
         frame.hands,
         pinchesByHand,
         settings.tuning,
         nowMs,
         anyAnchorDragging,
+        settings.snapEnabled,
       );
 
       if (creation.commit) {
@@ -227,8 +322,7 @@ function SceneController({ tracker }: { tracker: HandTracker }) {
           creation.commit.anchorA,
           creation.commit.anchorB,
         );
-        audioEngine.pluck(created.freq, 0.36);
-        store.triggerVibrationInPlace(created.id, 0.42, nowMs);
+        fireStringPluck(created, 0.36, 0.5, nowMs, false);
         touchingStrings.clear();
       }
 
@@ -245,7 +339,22 @@ function SceneController({ tracker }: { tracker: HandTracker }) {
         touchingStrings.clear();
       }
 
-      // 3) Per-hand playing, long-press selection, delete X, and intentional anchor editing
+      // 3) Expressive Hand modulation (open non-playing second hand -> Mod Wheel CC1 & FX)
+      const expr = expressionCtrl.update(
+        frame.hands,
+        pinchesByHand,
+        strings,
+        settings.expressionHandEnabled,
+        creation.active || anyAnchorDragging,
+      );
+      transientState.expression.active = expr.active;
+      transientState.expression.value = expr.value;
+      audioEngine.setExpression(expr.value);
+      if (settings.midiEnabled) {
+        midiEngine.sendCC(1, expr.value);
+      }
+
+      // 4) Per-hand playing, palm mute, long-press selection, delete X, and intentional editing
       if (!creation.suppressPlay) {
         const editableStrings = settings.editRequiresSelection
           ? selectedString
@@ -257,6 +366,32 @@ function SceneController({ tracker }: { tracker: HandTracker }) {
           const pinch = pinchesByHand.get(hand.id)!;
           const indexTip = hand.fingertips[8];
           const handleHitRadius = Math.max(0.115, hand.handScale * 0.44);
+
+          // --- Priority -1: Dragging Ball Sequencer Emitter in mid-air ---
+          if (emitterDragHandId === hand.id) {
+            if (!pinch.isPinching || !settings.ballSequencerEnabled) {
+              emitterDragHandId = null;
+            } else {
+              const aspect = tracker.projection.canvasAspect;
+              const ex = Math.max(-aspect + 0.1, Math.min(aspect - 0.1, pinch.point.x));
+              const ey = Math.max(-0.85, Math.min(0.88, pinch.point.y));
+              store.updateSettings({ ballEmitterX: ex, ballEmitterY: ey });
+            }
+            continue;
+          }
+
+          if (
+            settings.ballSequencerEnabled &&
+            pinch.justStarted &&
+            !anchorDrag.isActive(hand.id) &&
+            distance2D(pinch.point, {
+              x: settings.ballEmitterX,
+              y: settings.ballEmitterY,
+            }) <= 0.12
+          ) {
+            emitterDragHandId = hand.id;
+            continue;
+          }
 
           // --- Priority 0: Delete "X" button check (when a string is selected) ---
           if (selectedString && !anchorDrag.isActive(hand.id)) {
@@ -272,6 +407,8 @@ function SceneController({ tracker }: { tracker: HandTracker }) {
             );
 
             if (delRes.confirmedDeleteId) {
+              midiEngine.stopStringNote(delRes.confirmedDeleteId);
+              audioEngine.muteString(delRes.confirmedDeleteId);
               store.removeString(delRes.confirmedDeleteId);
               longPress.clearHand(hand.id);
               continue;
@@ -289,7 +426,7 @@ function SceneController({ tracker }: { tracker: HandTracker }) {
             }
           }
 
-          // --- Priority 1: Active Anchor Drag ---
+          // --- Priority 1: Active Anchor Handle or Whole-String Body Drag ---
           if (anchorDrag.isActive(hand.id)) {
             const session = anchorDrag.getSession(hand.id)!;
             const targetString = store.strings.find((s) => s.id === session.stringId);
@@ -303,29 +440,48 @@ function SceneController({ tracker }: { tracker: HandTracker }) {
               if (selectedId === session.stringId) {
                 longPress.notifySelected(nowMs);
               }
-              const fixedAnchor =
-                session.end === 'A' ? targetString.anchorB : targetString.anchorA;
-              const clamped = anchorDrag.clampPosition(pinch.point, fixedAnchor);
-              const res = store.updateStringAnchorsInPlace(
-                session.stringId,
-                session.end,
-                clamped,
-              );
-              hoveredHandle = {
-                stringId: session.stringId,
-                end: session.end,
-                grabbed: true,
-              };
 
-              if (res?.noteChanged && settings.previewSoundOnDrag) {
-                audioEngine.pluck(res.freq, 0.32);
-                store.triggerVibrationInPlace(session.stringId, 0.35, nowMs);
+              if (session.mode === 'body') {
+                const moved = anchorDrag.computeTranslatedAnchors(session, pinch.point);
+                store.translateStringInPlace(
+                  session.stringId,
+                  moved.anchorA,
+                  moved.anchorB,
+                );
+                hoveredHandle = {
+                  stringId: session.stringId,
+                  end: 'body',
+                  grabbed: true,
+                };
+              } else {
+                const fixedAnchor =
+                  session.mode === 'A' ? targetString.anchorB : targetString.anchorA;
+                const clamped = anchorDrag.clampAndSnapPosition(
+                  pinch.point,
+                  fixedAnchor,
+                  settings.snapEnabled,
+                );
+                const res = store.updateStringAnchorsInPlace(
+                  session.stringId,
+                  session.mode,
+                  clamped,
+                );
+                hoveredHandle = {
+                  stringId: session.stringId,
+                  end: session.mode,
+                  grabbed: true,
+                };
+
+                if (res?.noteChanged && settings.previewSoundOnDrag) {
+                  audioEngine.pluck(res.freq, 0.32);
+                  store.triggerVibrationInPlace(session.stringId, 0.35, nowMs);
+                }
               }
             }
             continue;
           }
 
-          // --- Priority 2: Intentional Anchor Grab (only on editable/selected strings) ---
+          // --- Priority 2: Intentional Anchor or Whole-String Grab (on editable/selected strings) ---
           const nearEditableHandle = hitTestHandles(
             pinch.point,
             editableStrings,
@@ -341,7 +497,7 @@ function SceneController({ tracker }: { tracker: HandTracker }) {
 
           if (pinch.justStarted && nearEditableHandle) {
             longPress.clearHand(hand.id);
-            anchorDrag.start(
+            anchorDrag.startHandle(
               hand.id,
               nearEditableHandle.stringId,
               nearEditableHandle.end,
@@ -354,8 +510,42 @@ function SceneController({ tracker }: { tracker: HandTracker }) {
             continue;
           }
 
-          // --- Priority 3: Long press dwell on string body (index fingertip) ---
-          // Suppress dwell while two hands are approaching each other to create a new string
+          // Whole-string body move when pinching the middle of the SELECTED string
+          if (pinch.justStarted && selectedString) {
+            const bodyHit = hitTestStrings(pinch.point, [selectedString], 0.11);
+            if (bodyHit) {
+              longPress.clearHand(hand.id);
+              anchorDrag.startBodyMove(
+                hand.id,
+                selectedString.id,
+                pinch.point,
+                selectedString.anchorA,
+                selectedString.anchorB,
+              );
+              hoveredHandle = {
+                stringId: selectedString.id,
+                end: 'body',
+                grabbed: true,
+              };
+              continue;
+            }
+          }
+
+          // --- Priority 3: Palm Mute (closed fist damps vibrating strings immediately) ---
+          if (settings.palmMuteEnabled && !pinch.isPinching) {
+            const mute = detectPalmMute(hand, strings);
+            if (mute.isFist) {
+              for (const mutedId of mute.mutedStringIds) {
+                store.dampVibrationInPlace(mutedId);
+                audioEngine.muteString(mutedId);
+                midiEngine.stopStringNote(mutedId);
+              }
+              longPress.clearHand(hand.id);
+              continue;
+            }
+          }
+
+          // --- Priority 4: Long press dwell on string body (index fingertip) ---
           const dwellDisabled =
             Boolean(nearEditableHandle) ||
             pinch.isPinching ||
@@ -376,8 +566,7 @@ function SceneController({ tracker }: { tracker: HandTracker }) {
             bestLongPressRing = lp.ring;
           }
 
-          // --- Priority 4: Clean single-hand (or open-hand) plucking ---
-          // Skip plucking if the user is pinching with 2 hands approaching to create
+          // --- Priority 5: Clean single-hand (or open-hand) plucking ---
           if (creation.readyHint.visible && pinch.isPinching) continue;
 
           const activeTips = settings.allFingertips ? FINGERTIP_INDICES : ([8] as const);
@@ -416,8 +605,7 @@ function SceneController({ tracker }: { tracker: HandTracker }) {
                     store.selectString(null);
                   }
 
-                  audioEngine.pluck(str.freq, intensity);
-                  store.triggerVibrationInPlace(str.id, intensity, nowMs);
+                  fireStringPluck(str, intensity, col.s, nowMs, true);
                 }
               } else {
                 touchingStrings.delete(contactKey);
@@ -427,13 +615,59 @@ function SceneController({ tracker }: { tracker: HandTracker }) {
         }
       }
 
-      // 4) Auto-deselect timeout (~4 s, paused while hovering delete X or dragging an anchor)
+      // 5) Physical Ball Sequencer step
+      const ballImpacts = ballSequencer.step(
+        dtSec,
+        nowMs,
+        {
+          enabled: settings.ballSequencerEnabled,
+          bpm: settings.ballBpm,
+          gravity: settings.ballGravity,
+          restitution: settings.ballRestitution,
+          emitter: { x: settings.ballEmitterX, y: settings.ballEmitterY },
+        },
+        strings,
+        tracker.projection.canvasAspect,
+      );
+      for (const impact of ballImpacts) {
+        fireStringPluck(impact.string, impact.intensity, impact.s, nowMs, true);
+      }
+
+      transientState.balls.length = ballSequencer.balls.length;
+      for (let i = 0; i < ballSequencer.balls.length; i++) {
+        const b = ballSequencer.balls[i];
+        transientState.balls[i] = { x: b.x, y: b.y, radius: b.radius };
+      }
+
+      // 6) Event Looper playback step
+      const loopStep = looper.step(nowMs, settings.looperBpm, settings.looperBars);
+      transientState.looper.mode = loopStep.snapshot.mode;
+      transientState.looper.eventCount = loopStep.snapshot.eventCount;
+      transientState.looper.progress = loopStep.snapshot.progress;
+      transientState.looper.currentBeat = loopStep.snapshot.currentBeat;
+      transientState.looper.totalBeats = loopStep.snapshot.totalBeats;
+
+      for (const ev of loopStep.dueEvents) {
+        const matchStr = strings.find((s) => s.id === ev.stringId);
+        if (matchStr) {
+          fireStringPluck(matchStr, ev.intensity, ev.s, nowMs, false);
+        } else {
+          // If the string was deleted, still replay the recorded note cleanly
+          audioEngine.pluck(ev.freq, ev.intensity, { pan: ev.pan, s: ev.s });
+          midiEngine.sendNote(ev.midi, ev.intensity, {
+            s: ev.s,
+            gateMs: settings.midiGateMs,
+          });
+        }
+      }
+
+      // 7) Auto-deselect timeout (~4 s, paused while hovering delete X or dragging)
       const keepSelectionAlive = bestDeleteHover.active || hoveredHandle.grabbed;
       if (longPress.isSelectionExpired(selectedId, nowMs, keepSelectionAlive)) {
         store.selectString(null);
       }
 
-      // 5) Publish non-reactive transient visuals for preview / ready halo / rings / handle hover
+      // 8) Publish non-reactive transient visuals
       if (creation.active && creation.session) {
         transientState.creationPreview.active = true;
         transientState.creationPreview.anchorA.x = creation.session.anchorA.x;
@@ -443,8 +677,10 @@ function SceneController({ tracker }: { tracker: HandTracker }) {
         transientState.creationPreview.note = creation.session.note;
         transientState.creationPreview.freq = creation.session.freq;
         transientState.creationPreview.isValid = creation.session.isValid;
+        transientState.creationPreview.snappedAxis = creation.session.snappedAxis;
       } else {
         transientState.creationPreview.active = false;
+        transientState.creationPreview.snappedAxis = null;
       }
 
       transientState.twoHandReady.visible = creation.readyHint.visible;
@@ -490,13 +726,12 @@ function SceneController({ tracker }: { tracker: HandTracker }) {
 
 /**
  * Renders the two-hand common-point magnetic halo, real-time string creation preview
- * (line + two anchors + live note pill), and the circular long-press dwell progress ring.
+ * (line + snap color + two anchors + live note pill), and the circular long-press dwell ring.
  */
 function TransientFeedbackMeshes() {
   const scene = useScene();
 
   useEffect(() => {
-    // 1) Two-hand common-point magnetic halo
     const readyTex = new DynamicTexture(
       'two-hand-ready-tex',
       { width: 160, height: 160 },
@@ -528,7 +763,6 @@ function TransientFeedbackMeshes() {
       const half = size / 2;
       ctx.clearRect(0, 0, size, size);
 
-      // Outer dashed ring showing the two hands are in the common-point zone
       ctx.save();
       ctx.beginPath();
       ctx.arc(half, half, half - 18, 0, Math.PI * 2);
@@ -539,7 +773,6 @@ function TransientFeedbackMeshes() {
       ctx.stroke();
       ctx.restore();
 
-      // Inner core dot
       ctx.beginPath();
       ctx.arc(half, half, pinchCount >= 1 ? 16 : 10, 0, Math.PI * 2);
       ctx.fillStyle =
@@ -550,7 +783,6 @@ function TransientFeedbackMeshes() {
     };
     drawReadyHalo(0);
 
-    // 2) Creation preview line + anchors + note label
     const previewPts = [new Vector3(0, 0, -0.1), new Vector3(0, 0, -0.1)];
     const previewLine: LinesMesh = MeshBuilder.CreateLines(
       'creation-preview-line',
@@ -586,7 +818,7 @@ function TransientFeedbackMeshes() {
 
     const previewNoteTex = new DynamicTexture(
       'preview-note-tex',
-      { width: 240, height: 96 },
+      { width: 260, height: 96 },
       scene,
       true,
     );
@@ -601,7 +833,7 @@ function TransientFeedbackMeshes() {
 
     const previewNotePlane = MeshBuilder.CreatePlane(
       'preview-note-plane',
-      { width: 0.23, height: 0.092 },
+      { width: 0.25, height: 0.092 },
       scene,
     );
     previewNotePlane.material = previewNoteMat;
@@ -609,7 +841,6 @@ function TransientFeedbackMeshes() {
     previewNotePlane.isPickable = false;
     previewNotePlane.metadata = { excludeGlow: true };
 
-    // 3) Long-press circular progress ring
     const ringTex = new DynamicTexture(
       'long-press-ring-tex',
       { width: 160, height: 160 },
@@ -640,7 +871,6 @@ function TransientFeedbackMeshes() {
     let lastReadyPinchCount = -1;
 
     const obs = scene.onBeforeRenderObservable.add(() => {
-      // Two-hand ready common-point halo
       const ready = transientState.twoHandReady;
       if (ready.visible) {
         readyPlane.isVisible = true;
@@ -656,7 +886,6 @@ function TransientFeedbackMeshes() {
         readyPlane.isVisible = false;
       }
 
-      // Creation preview update
       const p = transientState.creationPreview;
       if (p.active) {
         previewPts[0].set(p.anchorA.x, p.anchorA.y, -0.1);
@@ -666,9 +895,11 @@ function TransientFeedbackMeshes() {
           instance: previewLine,
         });
 
-        const col = p.isValid
-          ? new Color3(0.38, 1.0, 0.85)
-          : new Color3(1.0, 0.65, 0.35);
+        const col = !p.isValid
+          ? new Color3(1.0, 0.65, 0.35)
+          : p.snappedAxis
+            ? new Color3(1.0, 0.94, 0.5)
+            : new Color3(0.38, 1.0, 0.85);
         previewGlow.copyFrom(col);
         previewLine.color.copyFrom(col);
         anchorMat.emissiveColor = col;
@@ -684,7 +915,7 @@ function TransientFeedbackMeshes() {
         previewNotePlane.position.set(midX, midY, -0.28);
         previewNotePlane.isVisible = true;
 
-        const key = `${p.note}:${p.isValid}`;
+        const key = `${p.note}:${p.isValid}:${p.snappedAxis ?? ''}`;
         if (key !== lastPreviewKey) {
           lastPreviewKey = key;
           const ctx = previewNoteTex.getContext() as unknown as CanvasRenderingContext2D;
@@ -694,17 +925,27 @@ function TransientFeedbackMeshes() {
           ctx.beginPath();
           ctx.roundRect(12, 12, w - 24, h - 24, 34);
           ctx.fillStyle = p.isValid
-            ? 'rgba(10, 24, 32, 0.88)'
-            : 'rgba(38, 22, 12, 0.88)';
+            ? 'rgba(10, 24, 32, 0.9)'
+            : 'rgba(38, 22, 12, 0.9)';
           ctx.fill();
           ctx.lineWidth = 3;
-          ctx.strokeStyle = p.isValid ? '#5efce8' : '#ffb469';
+          ctx.strokeStyle = !p.isValid
+            ? '#ffb469'
+            : p.snappedAxis
+              ? '#ffe873'
+              : '#5efce8';
           ctx.stroke();
-          ctx.font = '700 38px system-ui, sans-serif';
+          ctx.font = '700 36px system-ui, sans-serif';
           ctx.textAlign = 'center';
           ctx.textBaseline = 'middle';
           ctx.fillStyle = '#ffffff';
-          ctx.fillText(p.isValid ? p.note : 'Allarga…', w / 2, h / 2 + 2);
+          const snapIcon =
+            p.snappedAxis === 'horizontal'
+              ? ' ⇄'
+              : p.snappedAxis === 'vertical'
+                ? ' ⇅'
+                : '';
+          ctx.fillText(p.isValid ? `${p.note}${snapIcon}` : 'Allarga…', w / 2, h / 2 + 2);
           previewNoteTex.update();
         }
       } else {
@@ -714,7 +955,6 @@ function TransientFeedbackMeshes() {
         previewNotePlane.isVisible = false;
       }
 
-      // Long-press progress ring update
       const lp = transientState.longPress;
       if (lp.active) {
         ringPlane.isVisible = true;
@@ -775,7 +1015,6 @@ function TransientFeedbackMeshes() {
 }
 
 function StringListLayer() {
-  // React re-renders ONLY when the strings list itself changes (add / delete / selection / tuning).
   const strings = useStringStore((s) => s.strings);
 
   return (
@@ -803,6 +1042,7 @@ export function AirScene({ tracker, video }: AirSceneProps) {
         <VideoBackground video={video} tracker={tracker} />
         <StringListLayer />
         <TransientFeedbackMeshes />
+        <EffectsLayer tracker={tracker} />
         <DeleteButton tracker={tracker} />
         <HandOverlay tracker={tracker} />
       </Scene>

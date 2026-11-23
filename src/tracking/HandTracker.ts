@@ -14,7 +14,7 @@ import {
 
 const MODEL_URL =
   'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
-const LOCAL_WASM_ROOT = '/mediapipe-wasm';
+const LOCAL_WASM_ROOT = `${import.meta.env.BASE_URL}mediapipe-wasm`;
 const HAND_RESET_TIMEOUT_MS = 280;
 const VELOCITY_HISTORY_LEN = 3;
 
